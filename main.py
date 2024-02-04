@@ -1,7 +1,7 @@
 from functools import wraps
 import jwt
 import requests
-from flask import Flask, request, render_template, jsonify, make_response
+from flask import Flask, request, jsonify, make_response
 from flask_sqlalchemy import SQLAlchemy
 import datetime
 import uuid
@@ -54,6 +54,14 @@ api_key = os.environ.get('CG_API')
 all_coins = requests.get(f"{gecko}/coins/list?include_platform=true&x_cg_api_key={api_key}").json()
 
 
+def get_price(coin_id):
+    res = requests.get(f"{gecko}/simple/price?ids={coin_id}&vs_currencies=usd&x_cg_api_key={api_key}").json()
+    if '%2C' not in coin_id:
+        return res[coin_id]['usd']
+    coin = coin_id.split('%2C')
+    return [res[c]['usd'] for c in coin]
+
+
 def token_required(f):
     @wraps(f)
     def wrapper(*args, **kwargs):
@@ -61,7 +69,7 @@ def token_required(f):
         if not token:
             return jsonify({"message": "Token is missing"})
         try:
-            data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=["HS256"], options={"verify_exp": False})
+            data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=["HS256"], options={"verify_exp": True})
             current_user = User.query.filter_by(public_id=data['public_id']).first()
         except:
             return jsonify({"message": "Token is invalid!"}), 401
@@ -170,7 +178,14 @@ def delete_user(current_user, public_id):
 @token_required
 def dashboard(current_user):
     pf_data = Portfolio.query.filter_by(user_id=current_user.public_id).all()
-    all_portfolio = [{'name': p.name, 'value': p.value, 'id': p.public_id, 'created': p.created} for p in pf_data]
+    # for portfolio in pf_data:
+    #     coin_list = Position.query.filter_by(portfolio_id=portfolio.public_id).all()
+    #     coins = []
+    #     for c in coin_list:
+    #         coin_data = {'id': c.coin_id, 'quantity': c.quantity}
+    #         coins.append(coin_data)
+
+    all_portfolio = [{'name': p.name, 'value': round(p.value, 2), 'id': p.public_id, 'created': p.created} for p in pf_data]
     return all_portfolio
 
 
@@ -178,6 +193,9 @@ def dashboard(current_user):
 @token_required
 def create_portfolio(current_user):
     name = request.form.get('name')
+    already_exist = Portfolio.query.filter_by(name=name, user_id=current_user.public_id).first()
+    if already_exist:
+        return jsonify({'message': f"You already have a portfolio named '{name}'"})
     if not name:
         return jsonify({'message': 'Please introduce a valid name.'})
     new_portfolio = Portfolio(name=name,
@@ -249,20 +267,27 @@ def get_coins(current_user):
 @app.route('/<portfolio_id>', methods=['POST'])
 @token_required
 def add_position(current_user, portfolio_id):
+    portfolio = Portfolio.query.filter_by(public_id=portfolio_id).first()
+    if current_user.public_id != portfolio.user_id and not current_user.admin:
+        return jsonify({'message': 'Cannot perform that function'})
+
     coin_id = request.form.get('coin_id')
     coin = [c for c in all_coins if c['id'] == coin_id]
     if not coin:
         return jsonify({'message': 'Bad request'})
+
     res = requests.get(f"{gecko}/simple/price?ids={coin_id}&vs_currencies=usd&x_cg_api_key={api_key}").json()
     price = res[coin_id]['usd']
+
     quantity = float(request.form.get('quantity'))
     try:
         buy_price = float(request.form.get('price'))
     except TypeError:
         buy_price = price
+
     if not quantity:
         return jsonify({'message': 'Introduce the quantity'})
-    old_position = Position.query.filter_by(coin_id=coin_id).first()
+    old_position = Position.query.filter_by(coin_id=coin_id, portfolio_id=portfolio_id).first()
     if not old_position:
         position = Position(name=coin[0]['name'],
                             coin_id=coin_id,
@@ -270,20 +295,23 @@ def add_position(current_user, portfolio_id):
                             quantity=quantity,
                             buy_price=buy_price,
                             current_price=price,
-                            value=quantity * price,
+                            value=round(quantity * price, 2),
                             price_change=int((100 - price * 100 / buy_price) * -1),
                             portfolio_id=portfolio_id
                             )
+        portfolio.value += position.value
         db.create_all()
         db.session.add(position)
         db.session.commit()
         return jsonify({'message': 'New position added'})
     new_buy_price = (old_position.buy_price * old_position.quantity + buy_price * quantity) / (old_position.quantity + quantity)
+    portfolio.value -= old_position.value
     old_position.quantity = quantity + old_position.quantity
     old_position.current_price = price
     old_position.buy_price = new_buy_price
-    old_position.value = old_position.quantity * price
+    old_position.value = round(old_position.quantity * price, 2)
     old_position.price_change = int((100 - price * 100 / new_buy_price) * -1)
+    portfolio.value += old_position.value
     db.session.commit()
     return jsonify({'message': 'Position modified'})
 
@@ -291,6 +319,9 @@ def add_position(current_user, portfolio_id):
 @app.route('/<portfolio_id>')
 @token_required
 def get_positions(current_user, portfolio_id):
+    portfolio = Portfolio.query.filter_by(public_id=portfolio_id).first()
+    if current_user.public_id != portfolio.user_id and not current_user.admin:
+        return jsonify({'message': 'Cannot perform that function'})
     positions = Position.query.filter_by(portfolio_id=portfolio_id).all()
     elements = []
     for pos in positions:
@@ -310,14 +341,23 @@ def get_positions(current_user, portfolio_id):
 @app.route('/<portfolio_id>/<coin_id>', methods=['PUT'])
 @token_required
 def edit_position(current_user, portfolio_id, coin_id):
-    res = requests.get(f"{gecko}/simple/price?ids={coin_id}&vs_currencies=usd&x_cg_api_key={api_key}").json()
-    price = res[coin_id]['usd']
+    portfolio = Portfolio.query.filter_by(public_id=portfolio_id).first()
+    if current_user.public_id != portfolio.user_id and not current_user.admin:
+        return jsonify({'message': 'Cannot perform that function'})
+
+    price = get_price(coin_id)
+    try:
+        buy_price = float(request.form.get('price'))
+    except TypeError:
+        buy_price = price
     position = Position.query.filter_by(coin_id=coin_id, portfolio_id=portfolio_id).first()
+    portfolio.value -= position.value
     position.quantity = float(request.form.get('quantity'))
     position.current_price = price
-    position.buy_price = float(request.form.get('price'))
-    position.value = position.quantity * price
+    position.buy_price = buy_price
+    position.value = round(position.quantity * price, 2)
     position.price_change = int((100 - price * 100 / position.buy_price) * -1)
+    portfolio.value += position.value
     db.session.commit()
     return jsonify({'message': 'Position modified'})
 
@@ -325,6 +365,9 @@ def edit_position(current_user, portfolio_id, coin_id):
 @app.route('/<portfolio_id>/<coin_id>', methods=['DELETE'])
 @token_required
 def delete_position(current_user, portfolio_id, coin_id):
+    portfolio = Portfolio.query.filter_by(public_id=portfolio_id).first()
+    if current_user.public_id != portfolio.user_id and not current_user.admin:
+        return jsonify({'message': 'Cannot perform that function'})
     position = Position.query.filter_by(coin_id=coin_id, portfolio_id=portfolio_id).first()
     db.session.delete(position)
     db.session.commit()
